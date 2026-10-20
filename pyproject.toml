@@ -1,0 +1,12 @@
+[project]
+name = "anisamplingmaster"
+version = "0.1.0"
+description = "PC音声を遡り録音してWAV保存し、音声認識の結果でファイル名を付けるツール"
+license = "MIT"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "soundcard>=0.4.4",
+    "pynput>=1.7.7",
+    "numpy>=1.24",
+    "faster-whisper>=1.1.0",
+]

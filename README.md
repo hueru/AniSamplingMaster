@@ -1,0 +1,87 @@
+# AniSamplingMaster
+
+PC で再生中の音声を録音して WAV で保存するツールです（Windows / macOS / Linux 対応）。
+
+- **遡り録音**: 常に直近 N 秒をバッファしており、録音ボタンを押した時点より前の音声から保存されます
+- **音声認識で自動命名**: セリフが入っていれば認識してファイル名に使います（faster-whisper、オフライン動作）
+- **命名規則を指定可能**: 日時・認識テキスト・連番・秒数などを自由に組み合わせ、サブフォルダ分けもできます
+- **グローバルホットキー**: 他のアプリを操作中でも録音の開始と停止ができます（既定は `Ctrl+Alt+R`）
+
+## セットアップ
+
+[uv](https://docs.astral.sh/uv/) だけあれば、Python 本体と依存ライブラリは自動で用意されます。
+
+```sh
+# uv のインストール（未導入の場合）
+# Windows:      powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+# macOS/Linux:  curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv sync
+```
+
+## 起動
+
+| OS | 方法 |
+|---|---|
+| Windows | `run.bat` をダブルクリック |
+| macOS / Linux | `./run.sh` |
+| 共通 | `uv run main.py` |
+
+初回の録音時に音声認識モデルをダウンロードします（small で約 480MB）。
+
+## OS ごとの注意
+
+### Windows
+追加の設定は不要です。入力デバイスで `[PC音声] スピーカー名` を選ぶと、そのスピーカーから出ている音を録音できます。
+
+### Linux
+PulseAudio または PipeWire（pipewire-pulse）が必要です。`[PC音声] Monitor of …` を選んでください。
+- `libpulse` が入っていない場合: `sudo apt install libpulse0`（Debian/Ubuntu）
+- グローバルホットキーは X11 でのみ動作します。Wayland ではウィンドウ内のボタンを使ってください。
+
+### macOS
+macOS には PC 音声をループバックする機能がないため、仮想オーディオデバイスが必要です。
+1. [BlackHole 2ch](https://existential.audio/blackhole/) をインストールします
+2. 「Audio MIDI 設定」で **複数出力装置**（スピーカーと BlackHole）を作成し、サウンド出力に設定します
+3. 本ツールの入力デバイスで `BlackHole 2ch` を選びます
+
+初回起動時にターミナルへの「マイク」の許可が必要です。グローバルホットキーを使う場合は、「アクセシビリティ」と「入力監視」の許可も必要です。
+
+## 命名規則
+
+Python の `str.format` 書式で指定します。
+
+| キー | 内容 | 例 |
+|---|---|---|
+| `{now:%Y%m%d_%H%M%S}` | 録音開始日時（strftime 書式） | `20261020_171346` |
+| `{date}` / `{time}` | 日付 / 時刻 | `20261020` / `171346` |
+| `{text}` | 認識したセリフ | `今日は良い天気ですね` |
+| `{text:.10}` | セリフの先頭 10 文字 | |
+| `{n:04d}` | 連番（設定に保存され、続きから振られます） | `0007` |
+| `{dur:.1f}` | 録音秒数 | `3.5` |
+| `{lang}` | 認識言語 | `ja` |
+| `{device}` | 録音デバイス名 | |
+
+- `/` を含めるとサブフォルダになります。例: `{now:%Y-%m-%d}/{n:04d}_{text}`
+- セリフが認識できなかった場合は「発話なしの時」に設定した文字列（既定: `音声なし`）が `{text}` に入ります
+- ファイル名に使えない文字（`?` `:` など）は全角に置き換えられます。同名のファイルがある場合は `_2` などの連番が付きます
+
+## 仕組み
+
+1. 選んだデバイスを常にモニタし、直近「遡り秒数」分をリングバッファに保持します
+2. 録音を開始するとバッファの内容を先頭に書き込み、以降の音声を追記します（16bit PCM WAV、48kHz）。録音中は `~rec_…wav` という一時ファイル名になります
+3. 停止後、バックグラウンドで音声認識（VAD で無音や BGM のみの区間は除外）を行い、命名規則に従ってリネームします
+
+設定はプロジェクト直下の `config.json` に保存されます。GPU（CUDA）を使う場合は、`config.json` の `whisper_device` を `"cuda"`、`whisper_compute_type` を `"float16"` にしてください。
+
+## 注意事項
+
+- 録音した音声（アニメ・動画・配信・音楽など）の著作権は、それぞれの権利者にあります。録音したデータは、私的利用など著作権法で認められた範囲で使ってください。無断での再配布や公開はしないでください。
+- 配信サービスによっては、利用規約で録音を禁止している場合があります。ご利用のサービスの規約を確認してください。
+- 本ツールの利用によって生じた損害について、作者は責任を負いません。
+
+## ライセンス
+
+[MIT License](LICENSE)
+
+使用している主なライブラリ: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)（MIT）、[SoundCard](https://github.com/bastibe/SoundCard)（BSD-3-Clause）、[pynput](https://github.com/moses-palmer/pynput)（LGPL-3.0）、[NumPy](https://numpy.org/)（BSD-3-Clause）
