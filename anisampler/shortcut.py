@@ -20,6 +20,7 @@ APP = "AniSamplingMaster"
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 MAIN = ROOT / "main.py"
+LAUNCHER = ROOT / "launch.pyw"  # Windows 用（コンソールなしで起動）
 BUNDLE_ID = "io.github.huerumk2.anisamplingmaster"
 
 
@@ -47,10 +48,14 @@ def _win_targets() -> list[Path]:
 
 
 def install_windows() -> list[Path]:
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    # uv の .venv\Scripts\pythonw.exe は内部でコンソール版 python.exe を起動し、
+    # ターミナルが開いてしまう。Python 本体の pythonw.exe で launch.pyw を実行する。
+    pythonw = Path(sys.base_prefix) / "pythonw.exe"
+    if not pythonw.exists():
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
     script = (
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:ASM_LNK);"
-        "$s.TargetPath = $env:ASM_TARGET; $s.Arguments = '\"' + $env:ASM_MAIN + '\" --log';"
+        "$s.TargetPath = $env:ASM_TARGET; $s.Arguments = '\"' + $env:ASM_MAIN + '\"';"
         "$s.WorkingDirectory = $env:ASM_ROOT; $s.IconLocation = $env:ASM_ICON + ',0';"
         "$s.Description = 'PC音声の遡り録音ツール'; $s.Save()"
     )
@@ -58,7 +63,7 @@ def install_windows() -> list[Path]:
     for lnk in _win_targets():
         lnk.parent.mkdir(parents=True, exist_ok=True)
         # パスに日本語や空白が含まれても崩れないよう環境変数で渡す
-        env = dict(os.environ, ASM_LNK=str(lnk), ASM_TARGET=str(pythonw), ASM_MAIN=str(MAIN),
+        env = dict(os.environ, ASM_LNK=str(lnk), ASM_TARGET=str(pythonw), ASM_MAIN=str(LAUNCHER),
                    ASM_ROOT=str(ROOT), ASM_ICON=str(ASSETS / "icon.ico"))
         subprocess.run(["powershell", "-NoProfile", "-Command", script], env=env, check=True)
         created.append(lnk)
