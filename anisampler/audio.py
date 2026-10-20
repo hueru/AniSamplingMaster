@@ -47,6 +47,7 @@ class Recorder:
         self.rate = SAMPLE_RATE
         self.channels = 2
         self.device_name = ""
+        self.is_loopback = False
 
         self._lock = threading.Lock()
         self._ring: collections.deque[bytes] = collections.deque()
@@ -95,6 +96,7 @@ class Recorder:
             self.sc.get_microphone, device.id, include_loopback=True).result()
         self.channels = max(1, min(int(mic.channels), 8))
         self.device_name = device.name
+        self.is_loopback = device.loopback
         self.error = None
         with self._lock:
             self._ring.clear()
@@ -112,6 +114,12 @@ class Recorder:
             self._stop.set()
             self._capture.join(timeout=2)
             self._capture = None
+
+    def clear_ring(self) -> None:
+        """遡り用に保持している音声を破棄する。"""
+        with self._lock:
+            self._ring.clear()
+            self._ring_frames = 0
 
     @property
     def monitoring(self) -> bool:
@@ -187,3 +195,66 @@ class Recorder:
             if w is not None:
                 w.close()
         return path, seconds
+
+
+def load_wav(path: str) -> tuple[np.ndarray, int]:
+    """16bit PCM WAV を (float32 の [フレーム, チャンネル] 配列, サンプルレート) で返す。"""
+    with wave.open(path, "rb") as w:
+        ch, rate, width = w.getnchannels(), w.getframerate(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    if width != 2:
+        raise ValueError("16bit PCM の WAV のみ再生できます")
+    data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    return data.reshape(-1, ch), rate
+
+
+class Player:
+    """WAV ファイルを既定のスピーカーで再生する簡易プレーヤー。"""
+
+    def __init__(self, sc) -> None:
+        self.sc = sc
+        self.path: str | None = None
+        self.position = 0.0
+        self.duration = 0.0
+        self.error: str | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    @property
+    def is_playing(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def play(self, path: str) -> None:
+        self.stop()
+        data, rate = load_wav(path)
+        self.path, self.error = path, None
+        self.position, self.duration = 0.0, len(data) / rate
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, args=(data, rate), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1)
+            self._thread = None
+
+    def _run(self, data: np.ndarray, rate: int) -> None:
+        try:
+            spk = self.sc.default_speaker()
+            out_ch = 1 if spk.channels == 1 else 2
+            if out_ch == 1:
+                data = data.mean(axis=1, keepdims=True)
+            elif data.shape[1] == 1:
+                data = np.repeat(data, 2, axis=1)  # モノラルは左右両方から鳴らす
+            else:
+                data = data[:, :2]
+            step = rate // 20  # 50ms ごとに停止要求を確認する
+            with spk.player(samplerate=rate, channels=out_ch, blocksize=1024) as player:
+                for i in range(0, len(data), step):
+                    if self._stop.is_set():
+                        break
+                    player.play(data[i:i + step])
+                    self.position = min(i + step, len(data)) / rate
+        except Exception as e:
+            self.error = f"再生エラー: {e}"

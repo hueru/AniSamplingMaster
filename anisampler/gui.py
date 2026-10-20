@@ -13,7 +13,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from . import config
-from .audio import Device, Recorder
+from .audio import Device, Player, Recorder
 from .hotkey import GlobalHotkey, HotkeyError
 from .naming import build_filename, prepare_text, unique_path
 from .transcriber import LANGUAGES, MODELS, Transcriber
@@ -57,6 +57,8 @@ class App:
         self.root = root
         self.cfg = config.load()
         self.recorder = Recorder()
+        self.player = Player(self.recorder.sc)
+        self._was_playing = False
         self.transcriber = Transcriber(self.cfg["whisper_device"], self.cfg["whisper_compute_type"])
         self.ui_q: queue.Queue[tuple] = queue.Queue()
         self.jobs: queue.Queue[dict | None] = queue.Queue()
@@ -130,6 +132,8 @@ class App:
                                  bg="#d93025", fg="white", activebackground="#b3261e",
                                  activeforeground="white", relief="flat", command=self.toggle_record)
         self.btn_rec.pack(side="left")
+        self.btn_play = ttk.Button(bar, text="▶", width=3, command=lambda: self.toggle_play())
+        self.btn_play.pack(side="left", padx=(4, 0))
         ttk.Label(bar, textvariable=self.v_elapsed, font=(FONT, 12), width=7).pack(side="left", padx=(8, 4))
         self.meter = ttk.Progressbar(bar, maximum=100, length=110)
         self.meter.pack(side="left", padx=4)
@@ -209,8 +213,13 @@ class App:
         ttk.Label(win, textvariable=self.v_status, style="Hint.TLabel").pack(fill="x", padx=10, pady=(4, 0))
 
         # --- 履歴
-        f = ttk.LabelFrame(win, text="録音履歴（ダブルクリックでファイルの場所を表示）")
+        f = ttk.LabelFrame(win, text="録音履歴（ダブルクリックで再生）")
         f.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        btns = ttk.Frame(f)
+        btns.pack(side="bottom", fill="x", pady=(4, 2))
+        ttk.Button(btns, text="▶ 再生", command=self._play_selected).pack(side="left", padx=4)
+        ttk.Button(btns, text="■ 停止", command=self.player.stop).pack(side="left", padx=4)
+        ttk.Button(btns, text="ファイルの場所を開く", command=self._reveal_selected).pack(side="left", padx=4)
         self.tree = ttk.Treeview(f, columns=("time", "file", "text"), show="headings", height=8)
         for col, label, w in (("time", "時刻", 70), ("file", "ファイル", 300), ("text", "認識テキスト", 300)):
             self.tree.heading(col, text=label)
@@ -219,7 +228,7 @@ class App:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.bind("<Double-1>", self._reveal_selected)
+        self.tree.bind("<Double-1>", lambda e: self._play_selected())
 
     def _show_settings(self) -> None:
         win = self.settings
@@ -253,6 +262,48 @@ class App:
         # モニターを外した場合などに画面外へ出ないようにする
         if vx <= x < vx + vw - 50 and vy <= y < vy + vh - 50:
             self.root.geometry(f"+{x}+{y}")
+
+    # ============================================================ 再生
+    def toggle_play(self, path: str | None = None) -> None:
+        if self.player.is_playing and path is None:
+            self.player.stop()
+            return
+        if self.recorder.is_recording:
+            self.v_status.set("録音中は再生できません")
+            return
+        path = path or self.last_saved
+        if not path or not os.path.exists(path):
+            self.v_status.set("再生できるファイルがありません")
+            return
+        try:
+            self.player.play(path)
+        except Exception as e:
+            self.v_status.set(f"再生できません: {e}")
+            return
+        self.v_status.set(f"再生中: {os.path.basename(path)}")
+
+    def _play_selected(self) -> None:
+        sel = self.tree.selection()
+        path = self.row_paths.get(sel[0]) if sel else None
+        if path and os.path.basename(path).startswith("~rec_"):
+            self.v_status.set("このファイルはまだ処理中です")
+            return
+        self.toggle_play(path or self.last_saved)
+
+    def _update_playback(self) -> None:
+        playing = self.player.is_playing
+        if playing:
+            pos = self.player.position
+            self.v_elapsed.set(f"{int(pos // 60):02d}:{pos % 60:04.1f}")
+        if playing != self._was_playing:
+            self.btn_play.configure(text="■" if playing else "▶")
+            if not playing:
+                self.v_elapsed.set("00:00.0")
+                self.v_status.set(self.player.error or "再生終了")
+                if self.recorder.is_loopback:
+                    # 再生した音がループバックで拾われ、次の遡り録音に混ざらないようにする
+                    self.recorder.clear_ring()
+            self._was_playing = playing
 
     def _reveal_last_saved(self, _event=None) -> None:
         if self.last_saved and os.path.exists(self.last_saved):
@@ -373,6 +424,9 @@ class App:
         except OSError as e:
             messagebox.showerror("保存先", f"保存先フォルダを作成できません:\n{e}")
             return
+        if self.player.is_playing:
+            self.player.stop()
+            self._update_playback()
         started = datetime.now()
         tmp = os.path.join(out_dir, f"~rec_{started:%Y%m%d_%H%M%S_%f}.wav")
         try:
@@ -384,6 +438,7 @@ class App:
         self.btn_rec.configure(text="■ 停止", bg="#444", activebackground="#222")
         self.cb_device.configure(state="disabled")
         self.btn_refresh.configure(state="disabled")
+        self.btn_play.configure(state="disabled")
         self.v_status.set("録音中…")
 
     def _stop_record(self) -> None:
@@ -405,6 +460,7 @@ class App:
         self.btn_rec.configure(text="● 録音", bg="#d93025", activebackground="#b3261e")
         self.cb_device.configure(state="readonly")
         self.btn_refresh.configure(state="normal")
+        self.btn_play.configure(state="normal")
         self.v_status.set(f"録音停止（{dur:.1f} 秒）")
         self._update_preview()
 
@@ -477,6 +533,7 @@ class App:
         if self.recorder.error and self.recorder.error != self._shown_error:
             self._shown_error = self.recorder.error
             self.v_status.set(self.recorder.error)
+        self._update_playback()
         if self.recorder.is_recording:
             sec = self.recorder.recorded_seconds
             self.v_elapsed.set(f"{int(sec // 60):02d}:{sec % 60:04.1f}")
@@ -534,6 +591,7 @@ class App:
         self.jobs.put(None)
 
     def _shutdown(self) -> None:
+        self.player.stop()
         if self.hotkey:
             self.hotkey.stop()
         self.recorder.close()
