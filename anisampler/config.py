@@ -18,6 +18,7 @@ DEFAULTS = {
     "max_text_len": 40,
     "fallback_text": "音声なし",
     "save_txt": False,
+    "embed_tags": True,
     "hotkey": "ctrl+alt+r",
     "counter": 1,
     "topmost": False,

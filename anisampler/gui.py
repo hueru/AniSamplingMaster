@@ -16,6 +16,7 @@ from . import config
 from .audio import Device, Player, Recorder
 from .hotkey import GlobalHotkey, HotkeyError
 from .naming import build_filename, prepare_text, unique_path
+from .tags import write_tags
 from .transcriber import LANGUAGES, MODELS, Transcriber
 
 TEMPLATE_HELP = (
@@ -105,6 +106,7 @@ class App:
         self.v_maxlen = tk.StringVar(value=str(c["max_text_len"]))
         self.v_fallback = tk.StringVar(value=c["fallback_text"])
         self.v_savetxt = tk.BooleanVar(value=c["save_txt"])
+        self.v_tags = tk.BooleanVar(value=c["embed_tags"])
         self.v_hotkey = tk.StringVar(value=c["hotkey"])
         self.v_topmost = tk.BooleanVar(value=c["topmost"])
         self.v_preview = tk.StringVar()
@@ -207,8 +209,10 @@ class App:
         ttk.Spinbox(f, from_=0, to=150, width=6, textvariable=self.v_maxlen).grid(row=1, column=2, sticky="w", **pad)
         ttk.Label(f, text="発話なしの時").grid(row=1, column=3, sticky="e", **pad)
         ttk.Entry(f, textvariable=self.v_fallback, width=14).grid(row=1, column=4, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(f, text="認識テキストをファイルのタグ（タイトル・コメント）に書き込む（DAW などでの検索用）",
+                        variable=self.v_tags).grid(row=2, column=0, columnspan=6, sticky="w", **pad)
         ttk.Label(f, text="※小さいモデルほど高速・低精度。初回はモデルをダウンロードします",
-                  style="Hint.TLabel").grid(row=2, column=0, columnspan=6, sticky="w", padx=6)
+                  style="Hint.TLabel").grid(row=3, column=0, columnspan=6, sticky="w", padx=6)
 
         ttk.Label(win, textvariable=self.v_status, style="Hint.TLabel").pack(fill="x", padx=10, pady=(4, 0))
 
@@ -328,6 +332,7 @@ class App:
             max_text_len=int(self._num(self.v_maxlen, 40, 0, 150)),
             fallback_text=self.v_fallback.get(),
             save_txt=self.v_savetxt.get(),
+            embed_tags=self.v_tags.get(),
             hotkey=self.v_hotkey.get(),
             topmost=self.v_topmost.get(),
         )
@@ -449,7 +454,7 @@ class App:
         meta.update(
             dur=dur, n=cfg["counter"],
             settings={k: cfg[k] for k in ("out_dir", "template", "recognize", "model", "language",
-                                          "max_text_len", "fallback_text", "save_txt")},
+                                          "max_text_len", "fallback_text", "save_txt", "embed_tags")},
         )
         cfg["counter"] += 1
         self._save_cfg()
@@ -490,7 +495,7 @@ class App:
                     err = f"音声認識に失敗: {e}"
             try:
                 path = self._finalize(job, text, lang)
-                self.ui_q.put(("saved", job["iid"], path, text, err))
+                self.ui_q.put(("saved", job["iid"], path, text, err or job.get("warning")))
             except Exception as e:
                 self.ui_q.put(("saved", job["iid"], job["tmp"], text, f"保存に失敗: {e}"))
         self.ui_q.put(("worker_done",))
@@ -518,6 +523,11 @@ class App:
             rel = build_filename(config.DEFAULTS["template"], **kwargs)
         path = unique_path(s["out_dir"], rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        if s["embed_tags"]:
+            try:
+                write_tags(job["tmp"], title=text, comment=text, date=job["started"], language=lang)
+            except Exception as e:  # タグが書けなくても録音ファイル自体は保存する
+                job["warning"] = f"タグを書き込めませんでした: {e}"
         os.replace(job["tmp"], path)
         if s["save_txt"] and text:
             with open(os.path.splitext(path)[0] + ".txt", "w", encoding="utf-8") as fp:
