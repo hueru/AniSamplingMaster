@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 MAIN = ROOT / "main.py"
 LAUNCHER = ROOT / "launch.pyw"  # Windows 用（コンソールなしで起動）
-BUNDLE_ID = "io.github.huerumk2.anisamplingmaster"
+BUNDLE_ID = "io.github.hueru.anisamplingmaster"
 
 
 def _try(*cmd: str) -> None:

@@ -604,7 +604,7 @@ def main() -> None:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
             # タスクバーに python ではなく本アプリのアイコンを表示させる
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("huerumk2.AniSamplingMaster")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("hueru.AniSamplingMaster")
         except Exception:
             pass
     root = tk.Tk(className="AniSamplingMaster")
