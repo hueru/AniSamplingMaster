@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -24,6 +25,18 @@ TEMPLATE_HELP = (
 )
 ICON = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icon.png")
 FONT = {"win32": "Yu Gothic UI", "darwin": "Hiragino Sans"}.get(sys.platform, "Noto Sans CJK JP")
+
+
+def virtual_screen(root: tk.Misc) -> tuple[int, int, int, int]:
+    """全モニターを合わせた領域 (x, y, 幅, 高さ) を返す。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            m = ctypes.windll.user32.GetSystemMetrics
+            return m(76), m(77), m(78), m(79)  # SM_X/Y/CX/CYVIRTUALSCREEN
+        except Exception:
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
 def open_path(path: str, reveal: bool = False) -> None:
@@ -76,7 +89,6 @@ class App:
             root.iconphoto(True, self._icon)
         except tk.TclError:
             pass
-        root.minsize(760, 560)
         style = ttk.Style()
         style.configure(".", font=(FONT, 10))
         style.configure("Hint.TLabel", foreground="#666", font=(FONT, 9))
@@ -92,14 +104,56 @@ class App:
         self.v_fallback = tk.StringVar(value=c["fallback_text"])
         self.v_savetxt = tk.BooleanVar(value=c["save_txt"])
         self.v_hotkey = tk.StringVar(value=c["hotkey"])
+        self.v_topmost = tk.BooleanVar(value=c["topmost"])
         self.v_preview = tk.StringVar()
         self.v_status = tk.StringVar(value="準備完了")
         self.v_elapsed = tk.StringVar(value="00:00.0")
+        self.last_saved: str | None = None
 
+        self._build_compact()
+        self._build_settings()
+
+        for v in (self.v_template, self.v_maxlen, self.v_fallback):
+            v.trace_add("write", lambda *a: self._update_preview())
+        self.v_preroll.trace_add("write", lambda *a: self._apply_preroll())
+        self._apply_preroll()
+        self._apply_topmost()
+        root.resizable(False, False)
+        self._restore_position()
+
+    def _build_compact(self) -> None:
+        """常時表示用の小さなメインウィンドウ（録音ボタン・経過時間・レベル・状態）。"""
+        root = self.root
+        bar = ttk.Frame(root, padding=(6, 6, 6, 0))
+        bar.pack(fill="x")
+        self.btn_rec = tk.Button(bar, text="● 録音", width=7, font=(FONT, 11, "bold"),
+                                 bg="#d93025", fg="white", activebackground="#b3261e",
+                                 activeforeground="white", relief="flat", command=self.toggle_record)
+        self.btn_rec.pack(side="left")
+        ttk.Label(bar, textvariable=self.v_elapsed, font=(FONT, 12), width=7).pack(side="left", padx=(8, 4))
+        self.meter = ttk.Progressbar(bar, maximum=100, length=110)
+        self.meter.pack(side="left", padx=4)
+        ttk.Checkbutton(bar, text="最前面", variable=self.v_topmost,
+                        command=self._apply_topmost).pack(side="left", padx=(6, 2))
+        ttk.Button(bar, text="⚙", width=3, command=self._show_settings).pack(side="left", padx=(2, 0))
+
+        # 状態表示（長い文字列でウィンドウが広がらないよう width=1 + fill で切り詰める）
+        st = ttk.Label(root, textvariable=self.v_status, style="Hint.TLabel", width=1, cursor="hand2")
+        st.pack(fill="x", padx=8, pady=(2, 5))
+        st.bind("<Button-1>", self._reveal_last_saved)
+
+    def _build_settings(self) -> None:
+        """設定と履歴のウィンドウ。閉じても破棄せず隠すだけにする。"""
+        win = self.settings = tk.Toplevel(self.root)
+        win.title("AniSamplingMaster - 設定")
+        win.minsize(720, 520)
+        win.withdraw()
+        win.protocol("WM_DELETE_WINDOW", self._hide_settings)
+        self._settings_placed = False
         pad = {"padx": 6, "pady": 3}
 
         # --- 保存設定
-        f = ttk.LabelFrame(root, text="保存設定")
+        f = ttk.LabelFrame(win, text="保存設定")
         f.pack(fill="x", padx=8, pady=(8, 4))
         f.columnconfigure(1, weight=1)
         ttk.Label(f, text="保存先").grid(row=0, column=0, sticky="w", **pad)
@@ -108,13 +162,13 @@ class App:
         ttk.Button(f, text="開く", command=self._open_folder).grid(row=0, column=3, **pad)
         ttk.Label(f, text="命名規則").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(f, textvariable=self.v_template).grid(row=1, column=1, columnspan=3, sticky="ew", **pad)
-        ttk.Label(f, text=TEMPLATE_HELP, style="Hint.TLabel", wraplength=700).grid(
+        ttk.Label(f, text=TEMPLATE_HELP, style="Hint.TLabel", wraplength=680).grid(
             row=2, column=1, columnspan=3, sticky="w", padx=6)
         ttk.Label(f, text="プレビュー").grid(row=3, column=0, sticky="w", **pad)
         ttk.Label(f, textvariable=self.v_preview).grid(row=3, column=1, columnspan=3, sticky="w", **pad)
 
         # --- 録音設定
-        f = ttk.LabelFrame(root, text="録音設定")
+        f = ttk.LabelFrame(win, text="録音設定")
         f.pack(fill="x", padx=8, pady=4)
         f.columnconfigure(1, weight=1)
         ttk.Label(f, text="入力デバイス").grid(row=0, column=0, sticky="w", **pad)
@@ -133,7 +187,7 @@ class App:
         ttk.Button(f, text="適用", command=self._apply_hotkey).grid(row=1, column=4, **pad)
 
         # --- 音声認識
-        f = ttk.LabelFrame(root, text="音声認識（ファイル名に使用）")
+        f = ttk.LabelFrame(win, text="音声認識（ファイル名に使用）")
         f.pack(fill="x", padx=8, pady=4)
         ttk.Checkbutton(f, text="有効", variable=self.v_recognize).grid(row=0, column=0, sticky="w", **pad)
         ttk.Label(f, text="モデル").grid(row=0, column=1, sticky="e", **pad)
@@ -152,23 +206,10 @@ class App:
         ttk.Label(f, text="※小さいモデルほど高速・低精度。初回はモデルをダウンロードします",
                   style="Hint.TLabel").grid(row=2, column=0, columnspan=6, sticky="w", padx=6)
 
-        # --- 録音操作
-        f = ttk.Frame(root)
-        f.pack(fill="x", padx=8, pady=6)
-        self.btn_rec = tk.Button(f, text="● 録音開始", width=14, font=(FONT, 14, "bold"),
-                                 bg="#d93025", fg="white", activebackground="#b3261e",
-                                 activeforeground="white", relief="flat", command=self.toggle_record)
-        self.btn_rec.pack(side="left", padx=(0, 10))
-        ttk.Label(f, textvariable=self.v_elapsed, font=(FONT, 16)).pack(side="left", padx=6)
-        lv = ttk.Frame(f)
-        lv.pack(side="left", fill="x", expand=True, padx=10)
-        ttk.Label(lv, text="入力レベル", style="Hint.TLabel").pack(anchor="w")
-        self.meter = ttk.Progressbar(lv, maximum=100)
-        self.meter.pack(fill="x")
-        ttk.Label(root, textvariable=self.v_status, style="Hint.TLabel").pack(fill="x", padx=10)
+        ttk.Label(win, textvariable=self.v_status, style="Hint.TLabel").pack(fill="x", padx=10, pady=(4, 0))
 
         # --- 履歴
-        f = ttk.Frame(root)
+        f = ttk.LabelFrame(win, text="録音履歴（ダブルクリックでファイルの場所を表示）")
         f.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.tree = ttk.Treeview(f, columns=("time", "file", "text"), show="headings", height=8)
         for col, label, w in (("time", "時刻", 70), ("file", "ファイル", 300), ("text", "認識テキスト", 300)):
@@ -179,12 +220,43 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._reveal_selected)
-        ttk.Label(root, text="ダブルクリックでファイルの場所を表示", style="Hint.TLabel").pack(anchor="e", padx=10)
 
-        for v in (self.v_template, self.v_maxlen, self.v_fallback):
-            v.trace_add("write", lambda *a: self._update_preview())
-        self.v_preroll.trace_add("write", lambda *a: self._apply_preroll())
-        self._apply_preroll()
+    def _show_settings(self) -> None:
+        win = self.settings
+        if win.state() == "withdrawn":
+            if not self._settings_placed:  # 初回はメインウィンドウの下に表示する
+                x = max(0, self.root.winfo_x() - 150)
+                y = self.root.winfo_y() + self.root.winfo_height() + 40
+                win.geometry(f"+{x}+{y}")
+                self._settings_placed = True
+            win.deiconify()
+        win.attributes("-topmost", self.v_topmost.get())
+        win.lift()
+        win.focus_set()
+
+    def _hide_settings(self) -> None:
+        self._save_cfg()
+        self.settings.withdraw()
+
+    def _apply_topmost(self) -> None:
+        on = self.v_topmost.get()
+        self.root.attributes("-topmost", on)
+        if hasattr(self, "settings"):
+            self.settings.attributes("-topmost", on)
+
+    def _restore_position(self) -> None:
+        m = re.fullmatch(r"\+(-?\d+)\+(-?\d+)", self.cfg.get("window_pos") or "")
+        if not m:
+            return
+        x, y = int(m.group(1)), int(m.group(2))
+        vx, vy, vw, vh = virtual_screen(self.root)
+        # モニターを外した場合などに画面外へ出ないようにする
+        if vx <= x < vx + vw - 50 and vy <= y < vy + vh - 50:
+            self.root.geometry(f"+{x}+{y}")
+
+    def _reveal_last_saved(self, _event=None) -> None:
+        if self.last_saved and os.path.exists(self.last_saved):
+            open_path(self.last_saved, reveal=True)
 
     # ============================================================ 設定値
     def _num(self, var: tk.StringVar, default: float, lo: float, hi: float) -> float:
@@ -206,6 +278,7 @@ class App:
             fallback_text=self.v_fallback.get(),
             save_txt=self.v_savetxt.get(),
             hotkey=self.v_hotkey.get(),
+            topmost=self.v_topmost.get(),
         )
         return self.cfg
 
@@ -329,7 +402,7 @@ class App:
                                                       os.path.basename(tmp), "処理中…"))
         self.row_paths[meta["iid"]] = tmp
         self.jobs.put(meta)
-        self.btn_rec.configure(text="● 録音開始", bg="#d93025", activebackground="#b3261e")
+        self.btn_rec.configure(text="● 録音", bg="#d93025", activebackground="#b3261e")
         self.cb_device.configure(state="readonly")
         self.btn_refresh.configure(state="normal")
         self.v_status.set(f"録音停止（{dur:.1f} 秒）")
@@ -421,6 +494,8 @@ class App:
             elif kind == "saved":
                 _, iid, path, text, err = msg
                 self.row_paths[iid] = path
+                if not err:
+                    self.last_saved = path
                 if self.tree.exists(iid):
                     self.tree.item(iid, values=(self.tree.set(iid, "time"),
                                                 os.path.relpath(path, self.cfg["out_dir"]),
@@ -452,6 +527,7 @@ class App:
             return
         if self.recorder.is_recording:
             self._stop_record()
+        self.cfg["window_pos"] = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
         self._save_cfg()
         self.closing = True  # 未処理の認識はスキップし、保存だけ済ませて終了
         self.v_status.set("終了処理中…")

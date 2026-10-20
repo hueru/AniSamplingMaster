@@ -20,6 +20,8 @@ DEFAULTS = {
     "save_txt": False,
     "hotkey": "ctrl+alt+r",
     "counter": 1,
+    "topmost": False,
+    "window_pos": "",
     "whisper_device": "cpu",
     "whisper_compute_type": "int8",
 }
