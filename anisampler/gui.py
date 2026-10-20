@@ -22,6 +22,7 @@ TEMPLATE_HELP = (
     "{text:.10} 先頭10文字  {n:04d} 連番  {dur:.1f} 秒数  {lang} 言語  {device} デバイス  "
     "「/」でサブフォルダ"
 )
+ICON = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icon.png")
 FONT = {"win32": "Yu Gothic UI", "darwin": "Hiragino Sans"}.get(sys.platform, "Noto Sans CJK JP")
 
 
@@ -70,6 +71,11 @@ class App:
         c = self.cfg
         root = self.root
         root.title("AniSamplingMaster")
+        try:
+            self._icon = tk.PhotoImage(file=ICON)
+            root.iconphoto(True, self._icon)
+        except tk.TclError:
+            pass
         root.minsize(760, 560)
         style = ttk.Style()
         style.configure(".", font=(FONT, 10))
@@ -463,8 +469,10 @@ def main() -> None:
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            # タスクバーに python ではなく本アプリのアイコンを表示させる
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("huerumk2.AniSamplingMaster")
         except Exception:
             pass
-    root = tk.Tk()
+    root = tk.Tk(className="AniSamplingMaster")
     App(root)
     root.mainloop()

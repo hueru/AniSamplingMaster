@@ -4,3 +4,4 @@ config.json
 *.pyc
 *.wav
 .DS_Store
+app.log
