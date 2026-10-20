@@ -450,6 +450,9 @@ class App:
         tmp, dur = self.recorder.stop_recording()
         meta = self.current or {}
         self.current = None
+        if self.recorder.rec_glitches:
+            meta["warning"] = (f"録音中に音の取りこぼしが {self.recorder.rec_glitches} 回ありました"
+                               "（PC の負荷が高い可能性があります）")
         cfg = self._collect_cfg()
         meta.update(
             dur=dur, n=cfg["counter"],

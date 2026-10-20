@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import queue
+import sys
 import threading
+import time
+import warnings
 import wave
 from dataclasses import dataclass
 
@@ -18,6 +22,13 @@ import numpy as np
 SAMPLE_WIDTH = 2  # bytes (16bit PCM)
 SAMPLE_RATE = 48000
 BLOCK = 1024
+# soundcard は blocksize をそのまま WASAPI のバッファ長に使う。BLOCK（約 21ms）のままだと、
+# 受け取り側が一瞬止まっただけで音を取りこぼすため、Windows では余裕を持たせる。
+DEVICE_BUFFER_SEC = 0.5 if sys.platform == "win32" else BLOCK / SAMPLE_RATE
+PLAYER_BUFFER_SEC = 0.5 if sys.platform == "win32" else BLOCK / SAMPLE_RATE
+# 何も再生されていない間 WASAPI ループバックはデータを返さないため、この時間以上データが
+# 来なければ無音で埋めて時間軸を保つ
+IDLE_FILL_SEC = 0.1
 
 
 @dataclass
@@ -53,19 +64,35 @@ class Recorder:
         self._ring: collections.deque[bytes] = collections.deque()
         self._ring_frames = 0
         self._capture: threading.Thread | None = None
+        self._processor: threading.Thread | None = None
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._stop = threading.Event()
+        self._last_silent = True
+        self.glitches = 0       # モニタ開始以降に音を取りこぼした回数
+        self.rec_glitches = 0   # 現在（直前）の録音中に取りこぼした回数
         self.error: str | None = None
         self._writer: wave.Wave_write | None = None
         self._writer_path: str | None = None
         self._rec_frames = 0
 
     def _import_sc(self) -> None:
-        import warnings
-
         import soundcard
-        # 無音区間の前後で毎回出る「data discontinuity」警告は無害なので抑制する
-        warnings.filterwarnings("ignore", message="data discontinuity")
         self.sc = soundcard
+        # WASAPI の「data discontinuity」は、バッファあふれで音を取りこぼした合図。
+        # 無音から音が鳴り始めたときにも出るため、直前のブロックが無音なら数えない。
+        warnings.filterwarnings("always", message="data discontinuity")
+        original = warnings.showwarning
+
+        def hook(message, category, filename, lineno, file=None, line=None):
+            if "data discontinuity" in str(message):
+                if not self._last_silent:
+                    self.glitches += 1
+                    if self.is_recording:
+                        self.rec_glitches += 1
+                return
+            original(message, category, filename, lineno, file, line)
+
+        warnings.showwarning = hook
 
     # ---- デバイス -------------------------------------------------------
     def list_devices(self) -> list[Device]:
@@ -102,6 +129,10 @@ class Recorder:
             self._ring.clear()
             self._ring_frames = 0
         self._stop.clear()
+        self._last_silent = True
+        self._queue = queue.Queue()
+        self._processor = threading.Thread(target=self._process_loop, args=(self._queue,), daemon=True)
+        self._processor.start()
         started = threading.Event()
         self._capture = threading.Thread(target=self._capture_loop, args=(mic, started), daemon=True)
         self._capture.start()
@@ -114,6 +145,10 @@ class Recorder:
             self._stop.set()
             self._capture.join(timeout=2)
             self._capture = None
+        if self._processor is not None:
+            self._queue.put(None)
+            self._processor.join(timeout=2)
+            self._processor = None
 
     def clear_ring(self) -> None:
         """遡り用に保持している音声を破棄する。"""
@@ -133,15 +168,54 @@ class Recorder:
 
     # ---- 音声処理 -------------------------------------------------------
     def _capture_loop(self, mic, started: threading.Event) -> None:
+        """デバイスから音を受け取ってキューに入れるだけにし、受け取りが止まらないようにする。"""
         try:
-            with mic.recorder(samplerate=self.rate, channels=self.channels, blocksize=BLOCK) as rec:
+            buffer = int(self.rate * DEVICE_BUFFER_SEC)
+            with mic.recorder(samplerate=self.rate, channels=self.channels, blocksize=buffer) as rec:
                 started.set()
-                while not self._stop.is_set():
-                    self._handle(rec.record(numframes=BLOCK))
+                wasapi = hasattr(rec, "_capture_available_frames")
+                for block in (self._read_wasapi(rec) if wasapi else self._read_generic(rec)):
+                    self._last_silent = not block.any()
+                    self._queue.put(block)
         except Exception as e:
             self.error = f"録音デバイスエラー: {e}"
         finally:
             started.set()
+
+    def _read_generic(self, rec):
+        while not self._stop.is_set():
+            yield rec.record(numframes=BLOCK)
+
+    def _read_wasapi(self, rec):
+        """WASAPI（Windows）用の読み取り。
+
+        soundcard の record() は「データなし」を確認してから待つ間にスレッドが止まると、
+        実際には音が届いていても確認し直さずに無音を差し込んでしまう（音の途切れになる）。
+        ここでは毎回データの有無を確認し、本当にデバイスが音を出していない間だけ無音で埋める。
+        """
+        channels = len(set(rec.channelmap))
+        idle_since = None
+        while not self._stop.is_set():
+            now = time.perf_counter()  # 先に時刻を取り、その後でデータの有無を確認する
+            if rec._capture_available_frames() > 0:
+                idle_since = None
+                chunk = rec._record_chunk()  # データがあるので soundcard の無音補完は通らない
+                if chunk.size:
+                    yield chunk.reshape(-1, channels)
+                continue
+            # ここに来た時点で、前回読んでから now までにデバイスは何も出していない
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= IDLE_FILL_SEC:
+                frames = int((now - idle_since) * self.rate)
+                idle_since += frames / self.rate
+                yield np.zeros((frames, channels), dtype=np.float32)
+            time.sleep(0.003)
+
+    def _process_loop(self, q: queue.Queue) -> None:
+        """変換・リングバッファ更新・ファイル書き込み（遅れても受け取りには影響しない）。"""
+        while (block := q.get()) is not None:
+            self._handle(block)
 
     def _handle(self, block: np.ndarray) -> None:
         if block.ndim == 1:
@@ -183,11 +257,16 @@ class Recorder:
             pre = b"".join(self._ring)[-need:] if need > 0 else b""
             w.writeframes(pre)
             self._rec_frames = len(pre) // frame_bytes
+            self.rec_glitches = 0
             self._writer = w
             self._writer_path = path
 
     def stop_recording(self) -> tuple[str, float]:
         """録音を終了し (ファイルパス, 秒数) を返す。"""
+        # 停止を押す前に受け取った音がまだキューに残っていれば、書き込みを待つ
+        deadline = time.monotonic() + 0.3
+        while not self._queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.005)
         with self._lock:
             w, path = self._writer, self._writer_path
             self._writer = self._writer_path = None
@@ -249,12 +328,39 @@ class Player:
                 data = np.repeat(data, 2, axis=1)  # モノラルは左右両方から鳴らす
             else:
                 data = data[:, :2]
-            step = rate // 20  # 50ms ごとに停止要求を確認する
-            with spk.player(samplerate=rate, channels=out_ch, blocksize=1024) as player:
-                for i in range(0, len(data), step):
-                    if self._stop.is_set():
-                        break
-                    player.play(data[i:i + step])
-                    self.position = min(i + step, len(data)) / rate
+            data = np.ascontiguousarray(data, dtype=np.float32)
+            with spk.player(samplerate=rate, channels=out_ch, blocksize=int(rate * PLAYER_BUFFER_SEC)) as player:
+                if hasattr(player, "_render_available_frames"):
+                    self._play_wasapi(player, data, rate)
+                else:
+                    step = rate // 20  # 50ms ごとに停止要求を確認する
+                    for i in range(0, len(data), step):
+                        if self._stop.is_set():
+                            break
+                        player.play(data[i:i + step])
+                        self.position = min(i + step, len(data)) / rate
         except Exception as e:
             self.error = f"再生エラー: {e}"
+
+    def _play_wasapi(self, player, data: np.ndarray, rate: int) -> None:
+        """WASAPI（Windows）用の再生。
+
+        soundcard の play() は、渡したデータより出力バッファの空きが大きいと、空き全体を
+        書き込んだことにして足りない分を無音で鳴らしてしまう（再生が途切れる）。
+        ここでは空きとデータの小さい方だけを書き込み、最後はバッファが空になるまで待つ。
+        """
+        ffi = sys.modules[type(player).__module__]._ffi
+        pos, total = 0, len(data)
+        while not self._stop.is_set():
+            if pos < total:
+                n = min(player._render_available_frames(), total - pos)
+                if n > 0:
+                    chunk = data[pos:pos + n].tobytes()
+                    ffi.memmove(player._render_buffer(n)[0], chunk, len(chunk))
+                    player._render_release(n)
+                    pos += n
+            buffered = player.currentpadding  # 書き込み済みでまだ鳴っていないフレーム数
+            self.position = max(0, pos - buffered) / rate
+            if pos >= total and buffered == 0:
+                break
+            time.sleep(0.005)
